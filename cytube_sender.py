@@ -1,24 +1,37 @@
 #!/usr/bin/env python3
 """
-YouTube to Cytube Python Script
+YouTube to Cytube Python Script with mpv Integration
 Replicates the functionality of the userscript but as a standalone Python application.
 
 Usage:
-    python cytube_sender.py "https://www.youtube.com/watch?v=VIDEO_ID"
-    python cytube_sender.py "CHANNEL" "https://www.youtube.com/watch?v=VIDEO_ID"
-    python cytube_sender.py "https://youtube.com/shorts/VIDEO_ID"
-    python cytube_sender.py "CHANNEL" "https://youtube.com/shorts/VIDEO_ID"
-    python cytube_sender.py "https://youtu.be/VIDEO_ID"
-    python cytube_sender.py "CHANNEL" "https://youtu.be/VIDEO_ID"
+    # Add a video (clears playlist)
+    python cytube_sender.py <CHANNEL> add <YOUTUBE_URL>
+    
+    # Play/resume current video
+    python cytube_sender.py <CHANNEL> play
+    
+    # Pause current video
+    python cytube_sender.py <CHANNEL> pause
+
+Examples:
+    python cytube_sender.py 'mychannel' add 'https://www.youtube.com/watch?v=VIDEO_ID'
+    python cytube_sender.py 'mychannel' play
+    python cytube_sender.py 'mychannel' pause
 
 Features:
 - Connects to Cytube WebSocket server
-- Clears the playlist
-- Skips current video
-- Queues the YouTube video
-- Auto-plays the newly added video
+- Clears the playlist before adding new videos
+- Adds videos without auto-playing
+- Play and pause commands for mpv integration
 - Works with any Cytube channel
 - Supports all YouTube URL formats
+
+MPV Integration:
+Add these lines to your mpv input.conf:
+    p script-message-to python_script cytube_play
+    SPACE script-message-to python_script cytube_pause
+
+Then create an mpv script that calls this Python script with play/pause commands.
 """
 
 import asyncio
@@ -44,11 +57,10 @@ class CytubeSender:
         self.max_reconnect_attempts = 3
         self.video_uid = None
         self.video_id = None
-        self.auto_play_attempted = False
+        self.playlist_cleared = False
 
     def log(self, message: str, level: str = "INFO"):
         """Print formatted log messages"""
-        # Print all messages for now to debug
         timestamp = time.strftime("%H:%M:%S")
         print(f"[{timestamp}] {level}: {message}")
 
@@ -215,22 +227,13 @@ class CytubeSender:
             self.log(f"✅ Video added to queue: {payload}")
             if isinstance(payload, dict) and payload.get('media') and payload.get('media', {}).get('id') == self.video_id:
                 self.video_uid = payload.get('uid')
-                self.log(f"🎯 Our video was added to queue, auto-playing: {payload.get('media', {}).get('title', 'Unknown')}")
-                # Auto-play after a short delay
-                await asyncio.sleep(1.5)
-                await self.play_video(self.video_uid)
+                self.log(f"🎯 Video added successfully: {payload.get('media', {}).get('title', 'Unknown')}")
         elif event == "playlist":
             if isinstance(payload, list):
                 self.log(f"📋 Current playlist: {len(payload)} videos")
-                # Check if our video is in playlist
-                found_video = next((item for item in payload
-                                  if item.get('media', {}).get('id') == self.video_id), None)
-                if found_video and not self.auto_play_attempted:
-                    self.log("🎯 Fallback: Playing our video from playlist")
-                    self.auto_play_attempted = True
-                    await self.play_video(found_video.get('uid'))
         elif event == "clearPlaylist":
             self.log("✅ Playlist cleared successfully")
+            self.playlist_cleared = True
         elif event == "changeMedia":
             if isinstance(payload, dict):
                 title = payload.get('title', 'Unknown')
@@ -257,9 +260,23 @@ class CytubeSender:
         if not self.socket or not self.is_connected:
             raise Exception("Not connected to Cytube")
 
+        self.playlist_cleared = False
         clear_message = '42["clearPlaylist",null]'
         await self.socket.send(clear_message)
         self.log("🧹 Sent clear playlist command")
+        
+        # Wait for confirmation that playlist was cleared
+        wait_count = 0
+        max_wait = 30  # 3 seconds
+        while not self.playlist_cleared and wait_count < max_wait:
+            await asyncio.sleep(0.1)
+            wait_count += 1
+        
+        if self.playlist_cleared:
+            self.log("✅ Playlist clear confirmed")
+        else:
+            self.log("⚠️ Playlist clear not confirmed, but proceeding", "WARN")
+        
         await asyncio.sleep(0.5)
 
     async def skip_current_video(self):
@@ -272,21 +289,26 @@ class CytubeSender:
         self.log("⏭️ Sent skip current video command")
         await asyncio.sleep(0.5)
 
-    async def play_video(self, uid: str):
-        """Play a specific video by UID"""
+    async def play(self):
+        """Resume/play the current video"""
         if not self.socket or not self.is_connected:
             raise Exception("Not connected to Cytube")
 
-        if not uid:
-            self.log("❌ No video UID provided", "ERROR")
-            return
-
-        play_message = f'42["jumpTo","{uid}"]'
+        play_message = '42["mediaUpdate",{"id":null,"currentTime":-1,"paused":false,"type":""}]'
         await self.socket.send(play_message)
-        self.log(f"▶️ Sent play video command for UID: {uid}")
+        self.log("▶️ Sent play command")
+
+    async def pause(self):
+        """Pause the current video"""
+        if not self.socket or not self.is_connected:
+            raise Exception("Not connected to Cytube")
+
+        pause_message = '42["mediaUpdate",{"id":null,"currentTime":-1,"paused":true,"type":""}]'
+        await self.socket.send(pause_message)
+        self.log("⏸️ Sent pause command")
 
     async def queue_video(self, video_id: str, title: str):
-        """Queue a YouTube video"""
+        """Queue a YouTube video (without auto-playing)"""
         if not self.socket or not self.is_connected:
             raise Exception("Not connected to Cytube")
 
@@ -304,18 +326,6 @@ class CytubeSender:
         queue_message = f'42["queue",{json.dumps(queue_data)}]'
         await self.socket.send(queue_message)
         self.log(f"🎯 Queued video: {title} (ID: {video_id})")
-
-        # Fallback: Check playlist after delay if auto-play didn't work
-        asyncio.create_task(self.fallback_check())
-
-    async def fallback_check(self):
-        """Fallback check to ensure video gets played"""
-        await asyncio.sleep(4)
-        if not self.auto_play_attempted:
-            self.log("📋 Requesting playlist for fallback check")
-            playlist_message = '42["requestPlaylist",null]'
-            if self.socket and self.is_connected:
-                await self.socket.send(playlist_message)
 
     def extract_video_info(self, youtube_url: str) -> tuple[str, str]:
         """Extract video ID and title from YouTube URL"""
@@ -346,12 +356,11 @@ class CytubeSender:
 
         return video_id, title
 
-    async def send_to_cytube(self, youtube_url: str):
-        """Main function to send YouTube video to Cytube"""
+    async def add_video_to_cytube(self, youtube_url: str):
+        """Add YouTube video to Cytube (clears playlist first, no auto-play)"""
         try:
             # Extract video information
             self.video_id, title = self.extract_video_info(youtube_url)
-            self.auto_play_attempted = False
 
             self.log(f"📺 Processing YouTube video: {title} (ID: {self.video_id})")
 
@@ -360,10 +369,10 @@ class CytubeSender:
             if not await self.connect_to_cytube():
                 raise Exception("Failed to connect to Cytube")
 
-            # Wait longer for permissions (increase timeout like userscript)
+            # Wait for permissions
             self.log("⏳ Waiting for permissions...")
             wait_count = 0
-            max_wait = 200  # Increased from 50 to 200 (20 seconds vs 5 seconds)
+            max_wait = 2  # 20 seconds
             while not self.permissions_received and wait_count < max_wait:
                 await asyncio.sleep(0.1)
                 wait_count += 1
@@ -389,17 +398,69 @@ class CytubeSender:
             except Exception as e:
                 self.log(f"⚠️ Skip failed, continuing: {e}", "WARN")
 
-            # Step 4: Queue new video (auto-play happens automatically)
+            # Step 4: Queue new video (WITHOUT auto-play)
             self.log("📤 Step 4: Queuing new video...")
             await self.queue_video(self.video_id, title)
 
-            self.log("✅ Video sent successfully! Playlist cleared, skipped, and playing.")
+            self.log("✅ Video added successfully! Playlist cleared. Use 'play' command to start playback.")
 
             # Keep connection alive for a bit to receive updates
-            await asyncio.sleep(6)
+            await asyncio.sleep(3)
 
         except Exception as e:
-            self.log(f"❌ Failed to send video: {e}", "ERROR")
+            self.log(f"❌ Failed to add video: {e}", "ERROR")
+            raise
+
+    async def send_play_command(self):
+        """Send play command to Cytube"""
+        try:
+            self.log("🔄 Connecting to send play command...")
+            if not await self.connect_to_cytube():
+                raise Exception("Failed to connect to Cytube")
+
+            # Wait for permissions
+            wait_count = 0
+            max_wait = 100
+            while not self.permissions_received and wait_count < max_wait:
+                await asyncio.sleep(0.1)
+                wait_count += 1
+
+            if not self.permissions_received:
+                self.log("⚠️ Proceeding with guest access", "WARN")
+                self.permissions_received = True
+
+            await self.play()
+            self.log("✅ Play command sent successfully!")
+            await asyncio.sleep(1)
+
+        except Exception as e:
+            self.log(f"❌ Failed to send play command: {e}", "ERROR")
+            raise
+
+    async def send_pause_command(self):
+        """Send pause command to Cytube"""
+        try:
+            self.log("🔄 Connecting to send pause command...")
+            if not await self.connect_to_cytube():
+                raise Exception("Failed to connect to Cytube")
+
+            # Wait for permissions
+            wait_count = 0
+            max_wait = 100
+            while not self.permissions_received and wait_count < max_wait:
+                await asyncio.sleep(0.1)
+                wait_count += 1
+
+            if not self.permissions_received:
+                self.log("⚠️ Proceeding with guest access", "WARN")
+                self.permissions_received = True
+
+            await self.pause()
+            self.log("✅ Pause command sent successfully!")
+            await asyncio.sleep(1)
+
+        except Exception as e:
+            self.log(f"❌ Failed to send pause command: {e}", "ERROR")
             raise
 
     async def listen_for_messages(self):
@@ -414,7 +475,7 @@ class CytubeSender:
         except Exception as e:
             self.log(f"❌ Socket error: {e}", "ERROR")
 
-    async def run(self, youtube_url: str):
+    async def run(self, command: str, youtube_url: Optional[str] = None):
         """Run the complete process"""
         try:
             # Connect and start listening
@@ -422,8 +483,17 @@ class CytubeSender:
                 # Start message listener in background
                 listener_task = asyncio.create_task(self.listen_for_messages())
 
-                # Send video to Cytube
-                await self.send_to_cytube(youtube_url)
+                # Execute command
+                if command == "add":
+                    if not youtube_url:
+                        raise ValueError("YouTube URL required for 'add' command")
+                    await self.add_video_to_cytube(youtube_url)
+                elif command == "play":
+                    await self.send_play_command()
+                elif command == "pause":
+                    await self.send_pause_command()
+                else:
+                    raise ValueError(f"Unknown command: {command}")
 
                 # Cancel listener task
                 listener_task.cancel()
@@ -444,26 +514,52 @@ class CytubeSender:
 
 def main():
     """Main entry point"""
-    if len(sys.argv) != 3:
+    if len(sys.argv) < 3:
         print("Usage:")
-        print("  python cytube_sender.py <CHANNEL> <YOUTUBE_URL>")
+        print("  python cytube_sender.py <CHANNEL> <COMMAND> [YOUTUBE_URL]")
+        print("")
+        print("Commands:")
+        print("  add <URL>  - Clear playlist and add a video (doesn't auto-play)")
+        print("  play       - Resume/play the current video")
+        print("  pause      - Pause the current video")
         print("")
         print("Examples:")
-        print("  python cytube_sender.py 'suckingonit' 'https://www.youtube.com/watch?v=dQw4w9WgXcQ'")
-        print("  python cytube_sender.py 'mychannel' 'https://youtu.be/VIDEO_ID'")
-        print("  python cytube_sender.py 'music' 'https://youtube.com/shorts/VIDEO_ID'")
+        print("  python cytube_sender.py 'mychannel' add 'https://www.youtube.com/watch?v=dQw4w9WgXcQ'")
+        print("  python cytube_sender.py 'mychannel' play")
+        print("  python cytube_sender.py 'mychannel' pause")
         print("")
-        print("For openwith extension: Use %s for URL, e.g.:")
-        print("  python cytube_sender.py 'mychannel' %s")
+        print("MPV Integration:")
+        print("  Create a Lua script in ~/.config/mpv/scripts/ that calls this script:")
+        print("  mp.register_script_message('cytube_play', function()")
+        print("    os.execute('python /path/to/cytube_sender.py mychannel play &')")
+        print("  end)")
+        print("  mp.register_script_message('cytube_pause', function()")
+        print("    os.execute('python /path/to/cytube_sender.py mychannel pause &')")
+        print("  end)")
+        print("")
+        print("  Then in input.conf:")
+        print("  p script-message cytube_play")
+        print("  SPACE script-message cytube_pause")
         sys.exit(1)
 
     channel = sys.argv[1]
-    youtube_url = sys.argv[2]
+    command = sys.argv[2].lower()
+    youtube_url = sys.argv[3] if len(sys.argv) > 3 else None
 
-    # Validate URL format
-    if not any(domain in youtube_url.lower() for domain in ['youtube.com', 'youtu.be']):
-        print("Error: Please provide a valid YouTube URL")
+    # Validate command
+    if command not in ['add', 'play', 'pause']:
+        print(f"Error: Unknown command '{command}'")
+        print("Valid commands: add, play, pause")
         sys.exit(1)
+
+    # Validate URL for add command
+    if command == 'add':
+        if not youtube_url:
+            print("Error: YouTube URL required for 'add' command")
+            sys.exit(1)
+        if not any(domain in youtube_url.lower() for domain in ['youtube.com', 'youtu.be']):
+            print("Error: Please provide a valid YouTube URL")
+            sys.exit(1)
 
     # Validate channel format
     if not channel or not isinstance(channel, str):
@@ -473,10 +569,12 @@ def main():
     # Create and run sender
     sender = CytubeSender(channel=channel)
     print(f"🎯 Target channel: {channel}")
-    print(f"📺 YouTube URL: {youtube_url}")
+    print(f"📋 Command: {command}")
+    if youtube_url:
+        print(f"📺 YouTube URL: {youtube_url}")
 
     try:
-        asyncio.run(sender.run(youtube_url))
+        asyncio.run(sender.run(command, youtube_url))
     except KeyboardInterrupt:
         print("\n🛑 Process interrupted by user")
     except Exception as e:
